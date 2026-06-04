@@ -1,0 +1,6 @@
+{
+  "name": "Micromouse Simulator V5",
+  "description": "High-fidelity robotic maze finder with intelligent bidirectional path compression, reverse-gear backtrack engines, and holographic digital twin diagnostics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
