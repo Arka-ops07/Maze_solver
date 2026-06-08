@@ -27,7 +27,7 @@ export default function ConsoleLogs({ logs, onClear }: ConsoleLogsProps) {
       <div className="flex items-center justify-between border-b border-[#111111] pb-1.5 mb-2">
         <div className="flex items-center gap-2">
           <Terminal className="w-3.5 h-3.5 text-[#00ff88] animate-pulse" />
-          <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-[#00ff88]">
+          <span className="font-mono text-xs font-bold uppercase tracking-wider text-[#00ff88]">
             Navigation Diagnostics Control
           </span>
         </div>
@@ -37,18 +37,18 @@ export default function ConsoleLogs({ logs, onClear }: ConsoleLogsProps) {
             className="p-1 text-neutral-500 hover:text-red-400 hover:bg-[#1a1a1a] rounded transition cursor-pointer"
             title="Clear Terminal Outputs"
           >
-            <Trash2 className="w-3" />
+            <Trash2 className="w-3.5" />
           </button>
         </div>
       </div>
 
       {/* Filter Tabs */}
-      <div className="flex flex-wrap gap-1 mb-2">
+      <div className="flex flex-wrap gap-1.5 mb-2">
         {['ALL', 'SYSTEM', 'EXPLORE', 'GEAR', 'COMPRESSION', 'SPEEDRUN'].map((category) => (
           <button
             key={category}
             onClick={() => setFilter(category)}
-            className={`px-1.5 py-0.5 rounded-sm text-[9px] font-mono font-medium transition cursor-pointer ${
+            className={`px-2 py-0.5 rounded-sm text-[11px] font-mono font-bold transition cursor-pointer ${
               filter === category
                 ? 'bg-[#00ff88]/15 text-[#00ff88] border border-[#00ff88]/30'
                 : 'text-neutral-500 hover:text-[#00ff88] hover:bg-[#111111] border border-transparent'
@@ -62,13 +62,13 @@ export default function ConsoleLogs({ logs, onClear }: ConsoleLogsProps) {
       {/* Messages Output */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto pr-1 font-mono text-[11px] leading-relaxed space-y-1.5 scrollbar-thin scrollbar-thumb-slate-800"
+        className="flex-1 overflow-y-auto pr-1 font-mono text-xs leading-relaxed space-y-1.5 scrollbar-thin scrollbar-thumb-slate-800"
         style={{ minHeight: '120px', maxHeight: '180px' }}
       >
         {filteredLogs.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-6 text-slate-500">
             <ShieldCheck className="w-6 h-6 mb-1 text-slate-600" />
-            <span className="text-[10px]">NO ACTIVE LOGS IN CURRENT FILTERS</span>
+            <span className="text-xs">NO ACTIVE LOGS IN CURRENT FILTERS</span>
           </div>
         ) : (
           filteredLogs.map((log) => {

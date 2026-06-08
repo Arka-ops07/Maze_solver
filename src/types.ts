@@ -29,6 +29,8 @@ export interface LogMessage {
 
 export type MazePreset = 'DEFAULT_DFS' | 'SPIRAL' | 'DOUBLE_CORRIDOR' | 'BLANK' | 'COMPLEX_LOOP';
 
+export type PathfindingAlgorithm = 'FLOOD_FILL' | 'DIJKSTRA' | 'ASTAR';
+
 export interface PathAction {
   type: 'F' | 'L' | 'R' | 'T'; // Forward, Left 90, Right 90, Turn 180 (usually not needed with reverse gear!)
   val: number; // Cells for F, degrees for L/R/T

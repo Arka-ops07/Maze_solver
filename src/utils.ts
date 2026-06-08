@@ -248,15 +248,19 @@ export function runFloodFillToStart(botMap: Cell[][]): void {
   }
 }
 
-// 3. Dijkstra Shortest Path Solver on Bot memory
+// 3. Shortest Path Solvers on Bot memory
+// 3a. Dijkstra Shortest Path Solver on Bot memory
 // Solves from start (0, 15) to center goals using only KNOWN walls.
-export function solveDijkstra(botMap: Cell[][]): { x: number; y: number }[] {
+export function solveDijkstra(botMap: Cell[][]): { path: { x: number; y: number }[]; cellsExplored: number } {
   const dist = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(Infinity));
   const prev = Array.from({ length: GRID_SIZE }, () => Array<{ x: number; y: number } | null>(GRID_SIZE).fill(null));
-  
   const visited = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(false));
   
   dist[15][0] = 0;
+  let cellsExplored = 0;
+  let found = false;
+  let finalGoalX = -1;
+  let finalGoalY = -1;
   
   // Custom simple priority-queue based loop
   for (let count = 0; count < GRID_SIZE * GRID_SIZE; count++) {
@@ -277,17 +281,14 @@ export function solveDijkstra(botMap: Cell[][]): { x: number; y: number }[] {
     if (uX === -1 || uY === -1) break;
     
     visited[uY][uX] = true;
+    cellsExplored++;
     
     // Check if we reached center goal
     if ((uX === 7 || uX === 8) && (uY === 7 || uY === 8)) {
-      // Reconstruct path
-      const path: { x: number; y: number }[] = [];
-      let curr: { x: number; y: number } | null = { x: uX, y: uY };
-      while (curr !== null) {
-        path.push(curr);
-        curr = prev[curr.y][curr.x];
-      }
-      return path.reverse();
+      found = true;
+      finalGoalX = uX;
+      finalGoalY = uY;
+      break;
     }
     
     for (let d = 0; d < 4; d++) {
@@ -307,7 +308,190 @@ export function solveDijkstra(botMap: Cell[][]): { x: number; y: number }[] {
     }
   }
   
-  return []; // Fallback in case of disconnected maze
+  if (!found) {
+    return { path: [], cellsExplored };
+  }
+
+  // Reconstruct path
+  const path: { x: number; y: number }[] = [];
+  let curr: { x: number; y: number } | null = { x: finalGoalX, y: finalGoalY };
+  while (curr !== null) {
+    path.push(curr);
+    curr = prev[curr.y][curr.x];
+  }
+  return { path: path.reverse(), cellsExplored };
+}
+
+// Helper Manhattan Heuristic generator for A* search towards 2x2 goals
+function getHeuristic(x: number, y: number): number {
+  const goals = [[7, 7], [7, 8], [8, 7], [8, 8]];
+  let minH = Infinity;
+  for (const [gx, gy] of goals) {
+    const dist = Math.abs(x - gx) + Math.abs(y - gy);
+    if (dist < minH) minH = dist;
+  }
+  return minH;
+}
+
+// 3b. A* Search Shortest Path Solver on Bot memory
+// Uses Manhattan distance heuristic towards center goal to minimize node expansions.
+export function solveAStar(botMap: Cell[][]): { path: { x: number; y: number }[]; cellsExplored: number } {
+  const gScore = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(Infinity));
+  const fScore = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(Infinity));
+  const prev = Array.from({ length: GRID_SIZE }, () => Array<{ x: number; y: number } | null>(GRID_SIZE).fill(null));
+  const closedSet = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(false));
+  
+  gScore[15][0] = 0;
+  fScore[15][0] = getHeuristic(0, 15);
+  
+  const openSet: { x: number; y: number }[] = [{ x: 0, y: 15 }];
+  let cellsExplored = 0;
+  let found = false;
+  let finalGoalX = -1;
+  let finalGoalY = -1;
+  
+  while (openSet.length > 0) {
+    // Pick node with lowest fScore estimate
+    let minIdx = 0;
+    let minF = fScore[openSet[0].y][openSet[0].x];
+    for (let i = 1; i < openSet.length; i++) {
+      const f = fScore[openSet[i].y][openSet[i].x];
+      if (f < minF) {
+        minF = f;
+        minIdx = i;
+      }
+    }
+    
+    const { x, y } = openSet[minIdx];
+    openSet.splice(minIdx, 1);
+    
+    if (!closedSet[y][x]) {
+      closedSet[y][x] = true;
+      cellsExplored++;
+    }
+    
+    if ((x === 7 || x === 8) && (y === 7 || y === 8)) {
+      found = true;
+      finalGoalX = x;
+      finalGoalY = y;
+      break;
+    }
+    
+    for (let d = 0; d < 4; d++) {
+      if (!(botMap[y][x].walls & WALL_BITS[d])) {
+        const nx = x + DX[d];
+        const ny = y + DY[d];
+        
+        if (inBounds(nx, ny) && !closedSet[ny][nx]) {
+          const tentativeG = gScore[y][x] + 1;
+          if (tentativeG < gScore[ny][nx]) {
+            prev[ny][nx] = { x, y };
+            gScore[ny][nx] = tentativeG;
+            fScore[ny][nx] = tentativeG + getHeuristic(nx, ny);
+            
+            if (!openSet.some(node => node.x === nx && node.y === ny)) {
+              openSet.push({ x: nx, y: ny });
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  if (!found) {
+    return { path: [], cellsExplored };
+  }
+  
+  const path: { x: number; y: number }[] = [];
+  let curr: { x: number; y: number } | null = { x: finalGoalX, y: finalGoalY };
+  while (curr !== null) {
+    path.push(curr);
+    curr = prev[curr.y][curr.x];
+  }
+  return { path: path.reverse(), cellsExplored };
+}
+
+// 3c. Flood Fill Potential Field Path Tracker on Bot memory
+// Runs standard BFS flood fill to compute distances, then chooses greedy steps following the gradient.
+export function solveFloodFillPath(botMap: Cell[][]): { path: { x: number; y: number }[]; cellsExplored: number } {
+  const dist = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(255));
+  const queue: { x: number; y: number }[] = [];
+  
+  const goals = [[7, 7], [7, 8], [8, 7], [8, 8]];
+  goals.forEach(([gx, gy]) => {
+    dist[gy][gx] = 0;
+    queue.push({ x: gx, y: gy });
+  });
+  
+  let cellsExplored = 0;
+  
+  while (queue.length > 0) {
+    const { x, y } = queue.shift()!;
+    cellsExplored++;
+    const currentDist = dist[y][x];
+    
+    for (let d = 0; d < 4; d++) {
+      if (!(botMap[y][x].walls & WALL_BITS[d])) {
+        const nx = x + DX[d];
+        const ny = y + DY[d];
+        
+        if (inBounds(nx, ny) && dist[ny][nx] === 255) {
+          dist[ny][nx] = currentDist + 1;
+          queue.push({ x: nx, y: ny });
+        }
+      }
+    }
+  }
+  
+  // Reconstruct path by following the steep flood fill values from (0, 15) to goal
+  const path: { x: number; y: number }[] = [{ x: 0, y: 15 }];
+  let cx = 0;
+  let cy = 15;
+  const pathSet = new Set<string>();
+  pathSet.add(`${cx},${cy}`);
+  let found = false;
+  
+  for (let steps = 0; steps < 500; steps++) {
+    if ((cx === 7 || cx === 8) && (cy === 7 || cy === 8)) {
+      found = true;
+      break;
+    }
+    
+    let bestNx = -1;
+    let bestNy = -1;
+    let minD = Infinity;
+    
+    for (let d = 0; d < 4; d++) {
+      if (!(botMap[cy][cx].walls & WALL_BITS[d])) {
+        const nx = cx + DX[d];
+        const ny = cy + DY[d];
+        
+        if (inBounds(nx, ny)) {
+          const dVal = dist[ny][nx];
+          if (dVal < minD && !pathSet.has(`${nx},${ny}`)) {
+            minD = dVal;
+            bestNx = nx;
+            bestNy = ny;
+          }
+        }
+      }
+    }
+    
+    if (bestNx === -1 || bestNy === -1) {
+      break;
+    }
+    
+    cx = bestNx;
+    cy = bestNy;
+    path.push({ x: cx, y: cy });
+    pathSet.add(`${cx},${cy}`);
+  }
+  
+  if (!found) {
+    return { path: [], cellsExplored };
+  }
+  
+  return { path, cellsExplored };
 }
 
 // 4. Path action compressor

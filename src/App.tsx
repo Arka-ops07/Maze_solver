@@ -22,12 +22,14 @@ import {
   ChevronRight,
   Info
 } from 'lucide-react';
-import { Cell, BotState, LogMessage, PathAction, MazePreset } from './types';
+import { Cell, BotState, LogMessage, PathAction, MazePreset, PathfindingAlgorithm } from './types';
 import {
   generateMaze,
   runFloodFill,
   runFloodFillToStart,
   solveDijkstra,
+  solveAStar,
+  solveFloodFillPath,
   compressPath,
   GRID_SIZE,
   DX,
@@ -44,6 +46,7 @@ export default function App() {
   const [logs, setLogs] = useState<LogMessage[]>([]);
   const [preset, setPreset] = useState<MazePreset>('DEFAULT_DFS');
   const [exploreMode, setExploreMode] = useState<'TO_GOAL' | 'FULL_MAPPING'>('FULL_MAPPING');
+  const [selectedAlgorithm, setSelectedAlgorithm] = useState<PathfindingAlgorithm>('DIJKSTRA');
   
   // Stats for HUD
   const [stepsCount, setStepsCount] = useState(0);
@@ -87,7 +90,32 @@ export default function App() {
   const explorationGoalRef = useRef<'CENTER' | 'START'>('CENTER');
   const previousCellRef = useRef<{ x: number; y: number }>({ x: 0, y: 15 });
 
+  // New refs to keep parameters in sync with physics engine loop (prevent stale closures)
+  const shortestPathCellsRef = useRef<{ x: number; y: number }[]>([]);
+  const compressedPathActionsRef = useRef<PathAction[]>([]);
+  const motorVelocityRef = useRef<number>(30);
+  const backtrackMultiplierRef = useRef<number>(1.8);
+  const scanLatencyRef = useRef<number>(15);
+  const exploreModeRef = useRef<'TO_GOAL' | 'FULL_MAPPING'>('FULL_MAPPING');
+
   const CELL_SIZE = 30;
+
+  // Synchronize dynamic parameters into refs
+  useEffect(() => {
+    motorVelocityRef.current = motorVelocity;
+  }, [motorVelocity]);
+
+  useEffect(() => {
+    backtrackMultiplierRef.current = backtrackMultiplier;
+  }, [backtrackMultiplier]);
+
+  useEffect(() => {
+    scanLatencyRef.current = scanLatency;
+  }, [scanLatency]);
+
+  useEffect(() => {
+    exploreModeRef.current = exploreMode;
+  }, [exploreMode]);
 
   // Initialize System on load
   useEffect(() => {
@@ -101,6 +129,17 @@ export default function App() {
   const handlePresetChange = (newPreset: MazePreset) => {
     setPreset(newPreset);
     handleHardReset(newPreset);
+  };
+
+  // Sync algorithm change
+  const handleAlgorithmChange = (newAlgo: PathfindingAlgorithm) => {
+    setSelectedAlgorithm(newAlgo);
+    pushLog('SYSTEM', `Switched routing engine pathfinder to: [${newAlgo}]`);
+    if (phase === 'SOLVED') {
+      setTimeout(() => {
+        planShortestPath(newAlgo);
+      }, 0);
+    }
   };
 
   // Push diagnostic log
@@ -180,7 +219,9 @@ export default function App() {
     setCurrentSpeedCellsPerSec(0);
     setSolvedLength(0);
     setShortestPathCells([]);
+    shortestPathCellsRef.current = [];
     setCompressedPathActions([]);
+    compressedPathActionsRef.current = [];
     setActiveActionIndex(-1);
     setPhase('READY');
     setLogs([]);
@@ -393,7 +434,7 @@ export default function App() {
       targetYRef.current = ny * CELL_SIZE + CELL_SIZE / 2;
       
       // Reset Sleep timer to trigger sensor scans on arrival
-      sleepTicksRef.current = scanLatency;
+      sleepTicksRef.current = scanLatencyRef.current;
     } else {
       // Unreachable path fallback. Force Flood Fill calculations to rebuild paths
       pushLog('ERROR', `Path exploration blocked at [${cx}, ${cy}]. Recalculating BFS routes.`);
@@ -402,23 +443,38 @@ export default function App() {
     }
   };
 
-  // Dijkstra + Bidirectional Compression Compilation
-  const planShortestPath = () => {
-    pushLog('SYSTEM', `Planning Dijkstra shortest-path utilizing bot's mapped memory...`);
-    const path = solveDijkstra(botMapRef.current);
+  // Algorithmic Shortest-Path Planning & Compression Compilation
+  const planShortestPath = (overrideAlgo?: PathfindingAlgorithm | any) => {
+    const activeAlgo = (typeof overrideAlgo === 'string') ? overrideAlgo : selectedAlgorithm;
+    let result: { path: { x: number; y: number }[]; cellsExplored: number };
+
+    if (activeAlgo === 'DIJKSTRA') {
+      pushLog('SYSTEM', `Planning shortest-path utilizing [Dijkstra's Algorithm] on bot's mapped memory...`);
+      result = solveDijkstra(botMapRef.current);
+    } else if (activeAlgo === 'ASTAR') {
+      pushLog('SYSTEM', `Planning shortest-path utilizing [A* Search (Manhattan Heuristic)] on bot's mapped memory...`);
+      result = solveAStar(botMapRef.current);
+    } else {
+      pushLog('SYSTEM', `Planning shortest-path utilizing [Flood Fill Potential Gradient] on bot's mapped memory...`);
+      result = solveFloodFillPath(botMapRef.current);
+    }
+
+    const { path, cellsExplored } = result;
     
     if (path.length === 0) {
-      pushLog('ERROR', `Failed to resolve any pathway to goals from mapped coordinates!`);
+      pushLog('ERROR', `Failed to resolve any pathway to goals from mapped coordinates using ${activeAlgo}!`);
       return;
     }
 
     setShortestPathCells(path);
+    shortestPathCellsRef.current = path;
     setSolvedLength(path.length - 1);
-    pushLog('SYSTEM', `Shortest path solved! Grid distance: ${path.length - 1} cells.`);
+    pushLog('SYSTEM', `${activeAlgo} solved! Path distance: ${path.length - 1} cells. Evaluated: ${cellsExplored} cells.`);
 
     // Compress turns into commands
     const actions = compressPath(path);
     setCompressedPathActions(actions);
+    compressedPathActionsRef.current = actions;
     
     const commandStr = actions.map((act) => `${act.gear === 'R' ? 'R-' : ''}${act.type}${act.val}`).join(' ➔ ');
     pushLog('COMPRESSION', `Optimized commands: [ ${commandStr} ]`);
@@ -428,7 +484,7 @@ export default function App() {
 
   // Speed Run Launcher
   const startSpeedRun = () => {
-    if (shortestPathCells.length === 0) {
+    if (shortestPathCellsRef.current.length === 0) {
       pushLog('ERROR', `No optimized path available. Scan and solve first.`);
       return;
     }
@@ -463,7 +519,7 @@ export default function App() {
   const deployNextSpeedRunStep = () => {
     const bot = botRef.current;
     
-    if (bot.speedIndex >= shortestPathCells.length - 1) {
+    if (bot.speedIndex >= shortestPathCellsRef.current.length - 1) {
       bot.state = 'FINISHED';
       setPhase('SOLVED');
       setActiveActionIndex(-1);
@@ -473,7 +529,7 @@ export default function App() {
 
     // Fetch the target cell coord
     const nextIdx = bot.speedIndex + 1;
-    const nextCell = shortestPathCells[nextIdx];
+    const nextCell = shortestPathCellsRef.current[nextIdx];
     
     const cx = bot.gridX;
     const cy = bot.gridY;
@@ -523,8 +579,8 @@ export default function App() {
     // Calculate how many Forward indices we have traversed
     let cumulativeSteps = 0;
     let actIdx = 0;
-    for (let idx = 0; idx < compressedPathActions.length; idx++) {
-      const act = compressedPathActions[idx];
+    for (let idx = 0; idx < compressedPathActionsRef.current.length; idx++) {
+      const act = compressedPathActionsRef.current[idx];
       if (act.type === 'F') {
         cumulativeSteps += act.val;
         if (nextIdx <= cumulativeSteps) {
@@ -538,7 +594,7 @@ export default function App() {
     setActiveActionIndex(actIdx);
 
     setStepsCount(nextIdx);
-    setDistanceRemaining(shortestPathCells.length - 1 - nextIdx);
+    setDistanceRemaining(shortestPathCellsRef.current.length - 1 - nextIdx);
     
     // Slight tick sleep to allow turns, but speed trials are fast
     sleepTicksRef.current = 2; 
@@ -554,15 +610,15 @@ export default function App() {
         sleepTicksRef.current--;
       } else {
         // Calculate velocity and apply reverse boosters/turn penalties
-        let baseVelocityVal = motorVelocity / 8; // scale down slider to fit comfortable frame ranges
+        let baseVelocityVal = motorVelocityRef.current / 8; // scale down slider to fit comfortable frame ranges
         if (bot.state === 'SPEED_RUNNING') {
-          baseVelocityVal = (motorVelocity * 1.5) / 8; // speed runs get default hyperboosts
+          baseVelocityVal = (motorVelocityRef.current * 1.5) / 8; // speed runs get default hyperboosts
         }
 
         // Apply reverse multiplier if backtracking
         let activeVelocity = baseVelocityVal;
         if (!bot.movingForward) {
-          activeVelocity = baseVelocityVal * backtrackMultiplier;
+          activeVelocity = baseVelocityVal * backtrackMultiplierRef.current;
         }
 
         // Distance vector
@@ -623,10 +679,10 @@ export default function App() {
             <Cpu className="w-4 h-4 text-[#00ff88] animate-spin" style={{ animationDuration: '8s' }} />
           </div>
           <div>
-            <h1 className="font-mono text-sm font-bold text-white tracking-widest flex items-center gap-2">
-              MICROMOUSE_V5 <span className="text-[9px] px-1 py-0.2 bg-[#00ff88]/10 text-[#00ff88] border border-[#00ff88]/20 rounded-sm font-normal">PROTOTYPE</span>
+            <h1 className="font-mono text-base md:text-lg font-bold text-white tracking-widest flex items-center gap-2">
+              MICROMOUSE_V5 <span className="text-[11px] px-1.5 py-0.5 bg-[#00ff88]/10 text-[#00ff88] border border-[#00ff88]/25 rounded-sm font-bold">PROTOTYPE</span>
             </h1>
-            <p className="text-[9px] text-neutral-400 font-mono tracking-wider uppercase">
+            <p className="text-[11.5px] md:text-xs text-neutral-400 font-mono tracking-wider uppercase">
               Path Compression & Intelligent Speed Run Engine
             </p>
           </div>
@@ -635,8 +691,8 @@ export default function App() {
         {/* Status Indicators */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="px-2.5 py-1 bg-[#050505] border border-[#222222] rounded flex items-center gap-2">
-            <div className="text-[9px] font-mono text-neutral-500 shrink-0">CURRENT PHASE</div>
-            <div className="px-1.5 py-0.5 rounded bg-[#00ff88]/5 border border-[#00ff88]/20 text-[10px] font-mono font-bold text-[#00ff88]">
+            <div className="text-xs font-mono text-neutral-500 shrink-0 font-semibold">CURRENT PHASE</div>
+            <div className="px-2 py-0.5 rounded bg-[#00ff88]/5 border border-[#00ff88]/20 text-xs font-mono font-bold text-[#00ff88]">
               {phase === 'READY' && '1. READY'}
               {phase === 'EXPLORE_TO_GOAL' && '1. EXPLORING TO GOAL'}
               {phase === 'EXPLORE_RETURN' && '1. EXPLORING BACK TO START'}
@@ -646,8 +702,8 @@ export default function App() {
           </div>
 
           <div className="px-2.5 py-1 bg-[#050505] border border-[#222222] rounded flex items-center gap-2">
-            <div className="text-[9px] font-mono text-neutral-500 uppercase">Bot State</div>
-            <div className="px-1.5 py-0.5 rounded bg-[#1a1a1a] border border-[#333] text-[10px] font-mono font-bold text-[#00ff88]">
+            <div className="text-xs font-mono text-neutral-500 uppercase font-semibold">Bot State</div>
+            <div className="px-2 py-0.5 rounded bg-[#1a1a1a] border border-[#333] text-xs font-mono font-bold text-[#00ff88]">
               {botRef.current.state}
             </div>
           </div>
@@ -662,7 +718,7 @@ export default function App() {
           <div className="bg-[#0a0a0a]/90 border border-[#222222] rounded p-3 text-left">
             <div className="flex items-center gap-2 border-b border-[#111111] pb-2 mb-3.5">
               <Sliders className="w-3.5 h-3.5 text-[#00ff88]" />
-              <h2 className="font-mono text-[10px] font-bold text-white uppercase tracking-wider">
+              <h2 className="font-mono text-xs md:text-sm font-bold text-white uppercase tracking-wider">
                 // MOTOR_SENSOR_TUNING
               </h2>
             </div>
@@ -672,8 +728,8 @@ export default function App() {
               {/* Slider 1: Motor Velocity */}
               <div className="space-y-1 p-2 bg-[#050505] rounded border border-[#111111] transition hover:border-[#222222]">
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono font-medium text-neutral-400">Motor Velocity</span>
-                  <span className="font-mono text-[10px] font-bold text-[#00ff88]">{motorVelocity} px/f</span>
+                  <span className="text-xs font-mono font-semibold text-neutral-400">Motor Velocity</span>
+                  <span className="font-mono text-xs font-bold text-[#00ff88]">{motorVelocity} px/f</span>
                 </div>
                 <input
                   type="range"
@@ -683,14 +739,14 @@ export default function App() {
                   onChange={(e) => setMotorVelocity(Number(e.target.value))}
                   className="w-full h-1 bg-[#151515] accent-[#00ff88] rounded appearance-none cursor-pointer"
                 />
-                <div className="text-[8.5px] text-neutral-500 font-mono tracking-tight">Controls pixel speed during driving steps</div>
+                <div className="text-[11px] text-neutral-400 font-mono tracking-tight font-medium">Controls pixel speed during driving steps</div>
               </div>
 
               {/* Slider 2: Backtrack Reverse multiplier */}
               <div className="space-y-1 p-2 bg-[#050505] rounded border border-[#111111] transition hover:border-[#222222]">
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono font-medium text-neutral-400">Backtrack Booster</span>
-                  <span className="font-mono text-[10px] font-bold text-[#00ff88]">⚡ {backtrackMultiplier}x</span>
+                  <span className="text-xs font-mono font-semibold text-neutral-400">Backtrack Booster</span>
+                  <span className="font-mono text-xs font-bold text-[#00ff88]">⚡ {backtrackMultiplier}x</span>
                 </div>
                 <input
                   type="range"
@@ -701,14 +757,14 @@ export default function App() {
                   onChange={(e) => setBacktrackMultiplier(Number(e.target.value))}
                   className="w-full h-1 bg-[#151515] accent-[#00ff88] rounded appearance-none cursor-pointer"
                 />
-                <div className="text-[8.5px] text-neutral-500 font-mono tracking-tight">Reversing speed multiplier for backtracks</div>
+                <div className="text-[11px] text-neutral-400 font-mono tracking-tight font-medium">Reversing speed multiplier for backtracks</div>
               </div>
 
               {/* Slider 3: Scan Latency */}
               <div className="space-y-1 p-2 bg-[#050505] rounded border border-[#111111] transition hover:border-[#222222]">
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono font-medium text-neutral-400">Sensor Scan Delay</span>
-                  <span className="font-mono text-[10px] font-bold text-[#00ff88]">{scanLatency} f</span>
+                  <span className="text-xs font-mono font-semibold text-neutral-400">Sensor Scan Delay</span>
+                  <span className="font-mono text-xs font-bold text-[#00ff88]">{scanLatency} f</span>
                 </div>
                 <input
                   type="range"
@@ -718,19 +774,19 @@ export default function App() {
                   onChange={(e) => setScanLatency(Number(e.target.value))}
                   className="w-full h-1 bg-[#151515] accent-[#00ff88] rounded appearance-none cursor-pointer"
                 />
-                <div className="text-[8.5px] text-neutral-500 font-mono tracking-tight">Pause states spent on each cell to sense walls</div>
+                <div className="text-[11px] text-neutral-400 font-mono tracking-tight font-medium">Pause states spent on each cell to sense walls</div>
               </div>
 
               {/* Mode Selectors */}
               <div className="space-y-1.5 p-2 bg-[#050505] rounded border border-[#111111]">
-                <span className="text-[10px] font-mono font-medium text-neutral-400 block mb-1">Explorer Navigation Mode</span>
+                <span className="text-xs font-mono font-semibold text-neutral-400 block mb-1">Explorer Navigation Mode</span>
                 <div className="grid grid-cols-2 gap-1.5">
                   <button
                     onClick={() => {
                       setExploreMode('TO_GOAL');
                       pushLog('SYSTEM', 'Configured explore mode: TO GOAL (stop at center)');
                     }}
-                    className={`p-1.5 rounded-sm font-mono text-[9px] font-bold border transition cursor-pointer ${
+                    className={`p-1.5 rounded-sm font-mono text-xs font-bold border transition cursor-pointer ${
                       exploreMode === 'TO_GOAL'
                         ? 'bg-[#00ff88]/15 text-[#00ff88] border-[#00ff88]/30 shadow-[0_0_6px_rgba(0,255,136,0.1)]'
                         : 'bg-[#111111] text-neutral-500 border-[#1a1a1a] hover:text-neutral-300'
@@ -743,7 +799,7 @@ export default function App() {
                       setExploreMode('FULL_MAPPING');
                       pushLog('SYSTEM', 'Configured explore mode: GO & RETURN (fully map elements)');
                     }}
-                    className={`p-1.5 rounded-sm font-mono text-[9px] font-bold border transition cursor-pointer ${
+                    className={`p-1.5 rounded-sm font-mono text-xs font-bold border transition cursor-pointer ${
                       exploreMode === 'FULL_MAPPING'
                         ? 'bg-[#00ff88]/15 text-[#00ff88] border-[#00ff88]/30 shadow-[0_0_6px_rgba(0,255,136,0.1)]'
                         : 'bg-[#111111] text-neutral-500 border-[#1a1a1a] hover:text-neutral-300'
@@ -761,38 +817,38 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2 border-b border-[#111111] pb-2 mb-2.5">
                 <Info className="w-3.5 h-3.5 text-[#00ff88]" />
-                <h3 className="font-mono text-[10px] font-bold text-white uppercase tracking-wider">
+                <h3 className="font-mono text-xs md:text-sm font-bold text-white uppercase tracking-wider">
                   // TECH_SPECIFICATIONS
                 </h3>
               </div>
-              <ul className="space-y-2 text-[9.5px] leading-relaxed font-mono text-neutral-400">
+              <ul className="space-y-2.5 text-xs leading-relaxed font-mono text-neutral-400 font-medium">
                 <li className="flex items-start gap-1.5">
                   <ChevronRight className="w-3.5 h-3.5 text-[#00ff88] shrink-0 mt-0.5" />
                   <span>
-                    <strong className="text-neutral-200">Bidirectional Shifting:</strong> If the next step is behind, the bot utilizes reverse gear instantly instead of spinning 180°.
+                    <strong className="text-neutral-250 font-bold text-white">Bidirectional Shifting:</strong> If the next step is behind, the bot utilizes reverse gear instantly instead of spinning 180°.
                   </span>
                 </li>
                 <li className="flex items-start gap-1.5">
                   <ChevronRight className="w-3.5 h-3.5 text-[#00ff88] shrink-0 mt-0.5" />
                   <span>
-                    <strong className="text-neutral-200">Path Compression:</strong> Turns and continuous straights are compiled step-by-step into motion instructions vectors.
+                    <strong className="text-neutral-250 font-bold text-white">Path Compression:</strong> Turns and continuous straights are compiled step-by-step into motion instructions vectors.
                   </span>
                 </li>
                 <li className="flex items-start gap-1.5">
                   <ChevronRight className="w-3.5 h-3.5 text-[#00ff88] shrink-0 mt-0.5" />
                   <span>
-                    <strong className="text-neutral-200">Digital Twin Sync:</strong> Scanning maps boundaries symmetrically to keep data routing consistent.
+                    <strong className="text-neutral-250 font-bold text-white">Digital Twin Sync:</strong> Scanning maps boundaries symmetrically to keep data routing consistent.
                   </span>
                 </li>
               </ul>
             </div>
 
             <div className="p-2 bg-[#050505] border border-[#111111] rounded mt-3 shrink-0">
-              <div className="flex justify-between items-center text-[9px] font-mono mb-1 text-neutral-400">
+              <div className="flex justify-between items-center text-xs font-mono mb-1 text-neutral-400 font-bold">
                 <span>ESTIMATED THRUST LEVEL</span>
                 <span className="text-[#00ff88] font-bold">OPTIMAL</span>
               </div>
-              <div className="h-1 w-full bg-[#1a1a1a] rounded overflow-hidden">
+              <div className="h-1.5 w-full bg-[#1a1a1a] rounded overflow-hidden">
                 <div className="h-full bg-[#00ff88] rounded" style={{ width: '85%' }}></div>
               </div>
             </div>
@@ -825,14 +881,14 @@ export default function App() {
           </div>
 
           {/* Interactive Button Slabs */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-2 bg-[#0a0a0a]/90 p-2.5 rounded border border-[#222222] shadow-none">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-2 bg-[#0a0a0a]/90 p-3 rounded border border-[#222222] shadow-none">
             {/* DFS Generator Preset Button */}
-            <div className="flex flex-col gap-0.5 col-span-1 text-left justify-center">
-              <label className="text-[8.5px] font-mono text-neutral-500 uppercase tracking-wider pl-1 font-bold">Maze Preset</label>
+            <div className="flex flex-col gap-1 col-span-1 text-left justify-center">
+              <label className="text-xs font-mono text-neutral-400 uppercase tracking-wider pl-1 font-extrabold text-[11px]">Maze Preset</label>
               <select
                 value={preset}
                 onChange={(e) => handlePresetChange(e.target.value as MazePreset)}
-                className="bg-[#050505] border border-[#222222] hover:border-[#00ff88] text-[#00ff88] py-2 px-1.5 rounded font-mono text-[10px] cursor-pointer focus:outline-none transition"
+                className="bg-[#050505] border border-[#222222] hover:border-[#00ff88] text-[#00ff88] py-2.5 px-2 rounded font-mono text-xs cursor-pointer focus:outline-none transition font-bold"
               >
                 <option value="DEFAULT_DFS">🏁 STD DFS Generator</option>
                 <option value="COMPLEX_LOOP">➰ Multi-Loop Circuit</option>
@@ -842,11 +898,25 @@ export default function App() {
               </select>
             </div>
 
+            {/* Pathfinding Algorithm Selection Dropdown */}
+            <div className="flex flex-col gap-1 col-span-1 text-left justify-center">
+              <label className="text-xs font-mono text-neutral-400 uppercase tracking-wider pl-1 font-extrabold text-[11px]">Pathfinding Algo</label>
+              <select
+                value={selectedAlgorithm}
+                onChange={(e) => handleAlgorithmChange(e.target.value as PathfindingAlgorithm)}
+                className="bg-[#050505] border border-[#222222] hover:border-[#00ff88] text-[#00ff88] py-2.5 px-2 rounded font-mono text-xs cursor-pointer focus:outline-none transition font-bold"
+              >
+                <option value="DIJKSTRA">🔍 Dijkstra's Solver</option>
+                <option value="ASTAR">⭐ A* Search Solver</option>
+                <option value="FLOOD_FILL">🔋 Flood Fill Potential</option>
+              </select>
+            </div>
+
             {/* Run button */}
             <button
               onClick={startExploration}
               disabled={botRef.current.state !== 'IDLE' || (phase === 'SOLVED')}
-              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#333] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#333] font-mono text-[10px] font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[38px]"
+              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#333] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#333] font-mono text-xs font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[42px]"
             >
               PHASE 1: EXPLORE
             </button>
@@ -855,7 +925,7 @@ export default function App() {
             <button
               onClick={planShortestPath}
               disabled={phase !== 'SOLVED' && botRef.current.state !== 'IDLE'}
-              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#333] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#333] font-mono text-[10px] font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[38px]"
+              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#333] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#333] font-mono text-xs font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[42px]"
             >
               PHASE 2: COMPRESS
             </button>
@@ -864,7 +934,7 @@ export default function App() {
             <button
               onClick={startSpeedRun}
               disabled={shortestPathCells.length === 0 || botRef.current.state === 'SPEED_RUNNING' || botRef.current.state === 'EXPLORING'}
-              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#302505] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#302505] font-mono text-[10px] font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[38px] shadow-[0_0_12px_rgba(0,255,136,0.05)]"
+              className="py-2 px-3 bg-[#111] hover:bg-[#00ff88] border border-[#302505] hover:border-[#00ff88] text-[#00ff88] hover:text-black disabled:opacity-20 disabled:hover:bg-[#111] disabled:hover:text-[#00ff88] disabled:hover:border-[#302505] font-mono text-xs font-bold rounded cursor-pointer transition uppercase text-center flex items-center justify-center min-h-[42px] shadow-[0_0_12px_rgba(0,255,136,0.05)]"
             >
               PHASE 3: SPEED RUN
             </button>
@@ -876,49 +946,49 @@ export default function App() {
           
           {/* Diagnostic Stats HUD Bar */}
           <div className="bg-[#0a0a0a]/90 border border-[#222222] rounded p-3 text-left shrink-0">
-            <h3 className="font-mono text-[10px] font-bold text-white uppercase tracking-wider mb-2.5">
+            <h3 className="font-mono text-xs md:text-sm font-bold text-white uppercase tracking-wider mb-2.5">
               // KINETIC_TELEMETRY
             </h3>
             
             <div className="grid grid-cols-2 gap-1.5 text-left">
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">GRID POSITION</div>
-                <div className="text-xs font-mono font-bold text-[#e5e5e5]">
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">GRID POSITION</div>
+                <div className="text-sm font-mono font-bold text-white mt-0.5">
                   [{botRef.current.gridX}, {botRef.current.gridY}]
                 </div>
               </div>
 
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">STEPS TAKEN</div>
-                <div className="text-xs font-mono font-bold text-[#e5e5e5]">
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">STEPS TAKEN</div>
+                <div className="text-sm font-mono font-bold text-white mt-0.5">
                   {stepsCount} / 256 cells
                 </div>
               </div>
 
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">FLOOD DISTANCE</div>
-                <div className="text-xs font-mono font-bold text-[#e5e5e5]">
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">FLOOD DISTANCE</div>
+                <div className="text-sm font-mono font-bold text-white mt-0.5">
                   {distanceRemaining === 255 ? 'UNSOLVED' : `${distanceRemaining} H-dist`}
                 </div>
               </div>
 
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">REVERSE RATIO</div>
-                <div className="text-xs font-mono font-bold text-[#e5e5e5] uppercase">
-                  ACTIVE GEAR <span className={activeGear === 'D' ? 'text-[#00ff88]' : 'text-rose-500 font-extrabold'}>[{activeGear}]</span>
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">REVERSE RATIO</div>
+                <div className="text-sm font-mono font-bold text-white mt-0.5 uppercase">
+                  GEAR <span className={activeGear === 'D' ? 'text-[#00ff88]' : 'text-rose-500 font-extrabold'}>[{activeGear}]</span>
                 </div>
               </div>
 
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">TURNS INDEXED</div>
-                <div className="text-xs font-mono font-bold text-[#e5e5e5]">
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">TURNS INDEXED</div>
+                <div className="text-sm font-mono font-bold text-white mt-0.5">
                   {turnsCount} Turns
                 </div>
               </div>
 
               <div className="p-2 bg-[#050505] rounded border border-[#111111]">
-                <div className="text-[8.5px] font-mono text-neutral-500 font-bold">ENGINE VELOCITY</div>
-                <div className="text-xs font-mono font-bold text-[#00ff88] animate-pulse">
+                <div className="text-[11px] font-mono text-neutral-500 font-bold">ENGINE VELOCITY</div>
+                <div className="text-sm font-mono font-bold text-[#00ff88] mt-0.5 animate-pulse">
                   {currentSpeedCellsPerSec} cells/s
                 </div>
               </div>
@@ -927,7 +997,7 @@ export default function App() {
             {/* Hard reset */}
             <button
               onClick={() => handleHardReset(preset)}
-              className="mt-3 w-full py-1.5 bg-[#111111] hover:bg-neutral-950 hover:text-red-300 border border-[#222222] hover:border-red-900/30 rounded font-mono text-[9px] font-bold tracking-widest text-[#00ff88] transition cursor-pointer"
+              className="mt-3 w-full py-2 bg-[#111111] hover:bg-neutral-950 hover:text-red-350 border border-[#222222] hover:border-red-900/30 rounded font-mono text-[11px] font-extrabold tracking-widest text-[#00ff88] transition cursor-pointer"
             >
               🔄 COLD RESET ENGINE
             </button>
@@ -936,10 +1006,10 @@ export default function App() {
           {/* Path action compiler sequence list */}
           <div className="bg-[#0a0a0a]/90 border border-[#222222] rounded p-3 text-left flex-1 flex flex-col min-h-[140px] max-h-[300px]">
             <div className="flex items-center justify-between border-b border-[#111111] pb-2 mb-2 shrink-0">
-              <span className="font-mono text-[10px] font-bold text-white uppercase tracking-wider">
+              <span className="font-mono text-xs md:text-sm font-bold text-white uppercase tracking-wider">
                 // PATH_ACTION_TIMELINE
               </span>
-              <span className="text-[9px] font-mono text-[#00ff88] font-bold bg-[#00ff88]/5 px-1.5 py-0.5 rounded border border-[#00ff88]/20 shrink-0 font-bold">
+              <span className="text-[11px] font-mono text-[#00ff88] font-bold bg-[#00ff88]/5 px-1.5 py-0.5 rounded border border-[#00ff88]/20 shrink-0">
                 COMPRESSION COMPILER
               </span>
             </div>
@@ -949,7 +1019,7 @@ export default function App() {
               {compressedPathActions.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-neutral-600 py-10">
                   <ArrowRightLeft className="w-5 h-5 mb-1.5 text-neutral-700" />
-                  <span className="text-[9px] font-mono uppercase tracking-wider">Awaiting compiler resolution...</span>
+                  <span className="text-[11px] font-mono uppercase tracking-wider">Awaiting compiler resolution...</span>
                 </div>
               ) : (
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 pt-0.5">
@@ -971,19 +1041,19 @@ export default function App() {
                     return (
                       <div
                         key={idx}
-                        className={`p-1.5 border rounded-sm font-mono text-[10px] flex flex-col gap-0.5 bg-[#050505] transition ${colorClasses} ${
+                        className={`p-1.5 border rounded-sm font-mono text-xs flex flex-col gap-0.5 bg-[#050505] transition ${colorClasses} ${
                           isCurrent
                             ? 'border-[#00ff88] bg-[#00ff88]/5 text-[#00ff88] font-extrabold shadow-[0_0_8px_rgba(0,255,136,0.1)] animate-pulse'
                             : ''
                         }`}
                       >
                         <div className="flex items-center justify-between border-b border-[#111111] pb-0.5 mb-1">
-                          <span className="text-[8px] text-neutral-600">#{idx + 1}</span>
-                          <span className={`text-[8px] font-bold ${act.gear === 'D' ? 'text-[#00ff88]' : 'text-rose-500'}`}>
+                          <span className="text-[10px] text-neutral-600">#{idx + 1}</span>
+                          <span className={`text-[10px] font-bold ${act.gear === 'D' ? 'text-[#00ff88]' : 'text-rose-500'}`}>
                             {act.gear === 'D' ? 'DRIVE' : 'REVERSE'}
                           </span>
                         </div>
-                        <span className="text-white text-[10px] truncate">{text}</span>
+                        <span className="text-white text-[11.5px] truncate font-semibold">{text}</span>
                       </div>
                     );
                   })}
@@ -1001,7 +1071,7 @@ export default function App() {
       </main>
 
       {/* Floating System HUD Footer bar */}
-      <footer className="bg-[#0a0a0a] border-t border-[#222222] px-4 py-2 flex items-center justify-between font-mono text-[9px] text-neutral-500 text-left shrink-0">
+      <footer className="bg-[#0a0a0a] border-t border-[#222222] px-4 py-2 flex items-center justify-between font-mono text-[11px] text-neutral-500 text-left shrink-0">
         <div>
           MICROMOUSE V5 • PATH COMPRESSION ENGINE
         </div>
